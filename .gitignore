@@ -1,0 +1,26 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+.venv/
+venv/
+env/
+backend/venv/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+
+# Logs and env files
+*.log
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
