@@ -1,0 +1,116 @@
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[a4paper,margin=0.65in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  urlcolor=blue,
+  linkcolor=black
+}
+
+\pagenumbering{gobble}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{3pt}
+\setlist[itemize]{leftmargin=*, topsep=2pt, itemsep=1pt}
+
+\titleformat{\section}{\large\bfseries}{}{0em}{}[\vspace{-4pt}\titlerule]
+\titlespacing*{\section}{0pt}{8pt}{4pt}
+
+\newcommand{\resumeSubheading}[4]{
+  \textbf{#1} \hfill \textbf{#2}\\
+  \textit{#3} \hfill \textit{#4}\\
+}
+
+\newcommand{\projectHeading}[2]{
+  \textbf{#1} \hfill \textbf{#2}\\
+}
+
+\begin{document}
+
+{\LARGE \textbf{Niraj Kumar}}\\
+\href{https://www.linkedin.com/in/nirajShahni/}{LinkedIn} \;|\;
+\href{https://github.com/Nirajlpu}{GitHub} \;|\;
+\href{mailto:nirajsahani2004@gmail.com}{nirajsahani2004@gmail.com} \;|\;
++91-6202714697
+
+\section*{Professional Summary}
+AI/ML and Full-Stack Developer with experience delivering computer vision, NLP, and real-time systems. Strong in Python, React, backend APIs, cloud deployment, and data-driven product engineering.
+
+\section*{Skills}
+\textbf{Languages:} Java, Python, JavaScript, TypeScript, Kotlin, Scala, SQL, HTML, CSS \\
+\textbf{Frameworks/Libraries:} Django, Flask, FastAPI, Spring Boot, React.js, TensorFlow, Scikit-learn, OpenCV, Keras, NumPy, Pandas \\
+\textbf{AI/ML:} YOLOv8/YOLO11, ArcFace, FaceNet, NLP, LSTM, CNN, LLMs, Sentiment Analysis, OpenAI API, Gemini API \\
+\textbf{Cloud/DevOps:} Azure App Service, Azure Blob Storage, Azure PostgreSQL, AWS EC2/S3, Docker, CI/CD, Firebase \\
+\textbf{Databases/Tools:} PostgreSQL, MySQL, MongoDB, SQLite, Git, Hadoop, Spark, Tableau
+
+\section*{Experience}
+\resumeSubheading
+  {Zidio Development}{Mar 2025 -- Apr 2025}
+  {Data Science \& Analytics Intern}{}
+\begin{itemize}
+  \item Developed ML models for sentiment analysis and task optimization using NLP and LSTM.
+  \item Created Plotly Dash dashboards for HR emotion and productivity insights.
+  \item Improved task efficiency by 25\% and reduced manual reporting by 30\%.
+  \item Collaborated with cross-functional teams in Agile sprint cycles.
+\end{itemize}
+
+\section*{Projects}
+\projectHeading{VisionIQ -- AI-Powered Video Surveillance Analytics Platform}{Jan 2026 -- Feb 2026}
+\textit{Python, Flask, React.js, TypeScript, OpenCV, YOLO11/YOLOv8, ArcFace, FAISS, PostgreSQL, JWT}
+\begin{itemize}
+  \item Delivered an end-to-end surveillance analytics platform for image and video intelligence workflows.
+  \item Implemented YOLO-based detection with frame sampling (2 FPS live analysis) and real-time webcam monitoring.
+  \item Added behavioral alerts for loitering, rapid motion, restricted-zone intrusion, and suspicious objects.
+  \item Integrated ArcFace + FAISS query-image matching and visitor tracking with PostgreSQL persistence for recurring identities.
+\end{itemize}
+
+\projectHeading{AI-Powered Emergency Response System with Autonomous Drones \& SOS App}{Oct 2025 -- Dec 2025}
+\textit{Python, Django Channels, FastAPI, React.js, Kotlin, WebRTC, YOLOv8, OpenCV, Docker, Azure, PostgreSQL, Redis, Celery}\\
+\href{https://tinyurl.com/3ae24us4}{Project Link}
+\begin{itemize}
+  \item Developed a real-time emergency response platform combining SOS alerts, drone assistance, and an officer dashboard.
+  \item Implemented an Android WebRTC client for live video and GPS streaming.
+  \item Engineered backend communication and AI inference microservices for incident analysis.
+  \item Deployed modular Dockerized services with cloud storage and relational data workflows.
+\end{itemize}
+
+\projectHeading{SBL Rent -- Full Stack Property Rental Platform}{Jun 2025 -- Jul 2025}
+\textit{Python, Django, JavaScript, Bootstrap, Razorpay, Azure, PostgreSQL, SQLite}\\
+\href{https://github.com/Nirajlpu/sblRent}{Code} \;|\; \href{https://sblrent-c9ehdmewcqcfhkh7.eastasia-01.azurewebsites.net/}{Live}
+\begin{itemize}
+  \item Built a production-ready rental marketplace for tenants and property owners.
+  \item Implemented authentication, role-based access, listings, filtering, bookings, and payment flows.
+  \item Integrated Razorpay and map-based search to improve secure transactions and property discovery.
+  \item Deployed on Azure with CI/CD, Blob Storage, and Azure PostgreSQL for reliable cloud operations.
+\end{itemize}
+
+\section*{Certifications}
+\begin{itemize}
+  \item Oracle Cloud Infrastructure Certified Generative AI Professional (Oct 2025)
+  \item Oracle Cloud Infrastructure Certified Data Science Professional (Oct 2025)
+  \item Machine Learning -- DeepLearning.AI \& Stanford University (Sep 2024)
+  \item Ethical Hacking -- NPTEL (Jul 2024), Meta Android Developer (Mar 2024)
+\end{itemize}
+
+\section*{Achievements}
+\begin{itemize}
+  \item Participated in Amazon HackOn Hackathon (Season 5) with an AI Trust \& Safety solution.
+  \item Solved 250+ LeetCode problems, earning 100-day and 150-day streak badges.
+  \item Built 10+ production-level AI/ML, mobile, and full-stack projects.
+\end{itemize}
+
+\section*{Education}
+\resumeSubheading
+  {Lovely Professional University, Punjab, India}{Expected 2027}
+  {B.Tech in Computer Science and Engineering (CGPA: 7.34)}{}
+\textbf{Sri Chaitanya Junior College} -- Intermediate (Science), 81\% \hfill
+\textbf{Blue Sky Public School} -- Matriculation, 62\%
+
+\end{document}
