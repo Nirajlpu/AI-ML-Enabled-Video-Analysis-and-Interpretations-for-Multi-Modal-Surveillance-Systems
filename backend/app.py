@@ -158,14 +158,24 @@ except Exception as e:
 
 # FAISS Index setup
 EMBEDDING_DIM = 512 # ArcFace buffalo_l produces 512-d embeddings
-faiss_index = faiss.IndexFlatL2(EMBEDDING_DIM) if faiss else None
+# Use Inner Product index — after L2-normalizing embeddings this equals cosine similarity.
+# This is the correct index for ArcFace / InsightFace embeddings.
+faiss_index = faiss.IndexFlatIP(EMBEDDING_DIM) if faiss else None
 visitor_ids = [] # To map FAISS index to visitor DB IDs
 
 # Video analytics configuration
 VIDEO_SAMPLE_EVERY_N_FRAMES = int(os.environ.get('VIDEO_SAMPLE_EVERY_N_FRAMES', 5))
 LOITERING_SECONDS = int(os.environ.get('LOITERING_SECONDS', 12))
 SUSPICIOUS_SPEED_PX = float(os.environ.get('SUSPICIOUS_SPEED_PX', 60.0))
-FACE_MATCH_THRESHOLD = float(os.environ.get('FACE_MATCH_THRESHOLD', 0.6))
+# Cosine similarity threshold for ArcFace.
+# After L2-normalizing embeddings, dot-product == cosine similarity.
+# Two faces with cosine_sim >= threshold are considered the same person.
+# Range: 0.0 (no match) to 1.0 (identical). 0.40 is a safe starting point.
+FACE_MATCH_THRESHOLD = float(os.environ.get('FACE_MATCH_THRESHOLD', 0.40))
+# Minimum face detection confidence score (InsightFace det_score field)
+FACE_QUALITY_THRESHOLD = float(os.environ.get('FACE_QUALITY_THRESHOLD', 0.70))
+# Minimum face bounding-box area in pixels to avoid tiny/noisy detections
+FACE_MIN_AREA_PX = int(os.environ.get('FACE_MIN_AREA_PX', 1600))  # 40x40 px
 HEATMAP_GRID_SIZE = int(os.environ.get('HEATMAP_GRID_SIZE', 20))
 MAX_QUERY_IMAGES = int(os.environ.get('MAX_QUERY_IMAGES', 20))
 
@@ -173,11 +183,26 @@ SUSPICIOUS_OBJECT_KEYWORDS = {
     'knife', 'gun', 'firearm', 'pistol', 'rifle', 'weapon'
 }
 
+# ---------------------------------------------------------------------------
+# Embedding utilities
+# ---------------------------------------------------------------------------
+
+def normalize_embedding(emb: np.ndarray) -> np.ndarray:
+    """L2-normalize an ArcFace embedding so dot-product == cosine similarity."""
+    norm = np.linalg.norm(emb)
+    if norm < 1e-10:
+        return emb.astype('float32')
+    return (emb / norm).astype('float32')
+
+
 def load_visitors_into_faiss():
+    """Reload all visitor embeddings (normalized) from DB into the FAISS index."""
     global visitor_ids
     if not faiss or not faiss_index:
         return
     conn = get_db_connection()
+    if not conn:
+        return
     try:
         cur = conn.cursor()
         cur.execute("SELECT id, embedding FROM visitors WHERE embedding IS NOT NULL")
@@ -186,14 +211,19 @@ def load_visitors_into_faiss():
             embeddings = []
             visitor_ids = []
             for row in rows:
-                embedding = np.frombuffer(row[1], dtype=np.float32)
-                embeddings.append(embedding)
+                raw = np.frombuffer(row[1], dtype=np.float32).copy()
+                # Always normalize so the IndexFlatIP gives cosine similarity scores
+                emb = normalize_embedding(raw)
+                embeddings.append(emb)
                 visitor_ids.append(row[0])
-            
+
             if embeddings:
                 faiss_index.reset()
                 faiss_index.add(np.array(embeddings).astype('float32'))
-                logger.info(f"Loaded {len(visitor_ids)} visitors into FAISS index.")
+                logger.info(f"Loaded {len(visitor_ids)} visitors into FAISS index (normalized).")
+        else:
+            visitor_ids = []
+            faiss_index.reset()
     except Exception as e:
         logger.error(f"Error loading visitors into FAISS: {e}")
     finally:
@@ -224,6 +254,7 @@ def _open_video_capture_from_upload(video_file):
         raise
 
 def _extract_faces_with_embeddings(frame):
+    """Detect faces in *frame*, apply quality filters, and return L2-normalized embeddings."""
     if not face_app:
         return []
 
@@ -232,9 +263,35 @@ def _extract_faces_with_embeddings(frame):
         parsed = []
         for face in faces:
             fx1, fy1, fx2, fy2 = face.bbox.tolist()
+
+            # --- Quality filter 1: minimum detection confidence ---
+            det_score = getattr(face, 'det_score', 1.0)  # default 1.0 if field absent
+            if det_score < FACE_QUALITY_THRESHOLD:
+                logger.debug(f"Skipping low-quality face det_score={det_score:.2f}")
+                continue
+
+            # --- Quality filter 2: minimum bounding box area ---
+            face_area = max(0, fx2 - fx1) * max(0, fy2 - fy1)
+            if face_area < FACE_MIN_AREA_PX:
+                logger.debug(f"Skipping tiny face area={face_area:.0f}px")
+                continue
+
+            # --- Pose filter: only approximately front-facing faces ---
+            if hasattr(face, 'pose') and face.pose is not None:
+                yaw, pitch, roll = face.pose
+                if abs(yaw) > 35 or abs(pitch) > 35:  # slightly relaxed from 20° to handle natural head tilt
+                    logger.debug(f"Skipping non-frontal face yaw={yaw:.1f} pitch={pitch:.1f}")
+                    continue
+
+            # --- Normalize embedding for cosine-similarity comparison ---
+            raw_emb = face.embedding if hasattr(face, 'embedding') else None
+            norm_emb = normalize_embedding(raw_emb.astype('float32')) if raw_emb is not None else None
+
             parsed.append({
                 'bbox': [fx1, fy1, fx2, fy2],
-                'embedding': face.embedding.astype('float32') if hasattr(face, 'embedding') else None
+                'embedding': norm_emb,
+                'pose': face.pose if hasattr(face, 'pose') else None,
+                'det_score': float(det_score),
             })
         return parsed
     except Exception as e:
@@ -312,34 +369,57 @@ def _match_queries_in_frame(query_signatures, frame_labels, frame_face_embedding
         if signature.get('error'):
             continue
 
+        # Only match by object label if it's not just 'person' (avoid confusing person detection with face match)
         label_overlap = set(signature['labels']).intersection(frame_labels)
-        if label_overlap:
+        if label_overlap and not (label_overlap == {'person'}):
             signature['matched'] = True
             signature['first_match_time_sec'] = round(float(timestamp_sec), 2)
             signature['match_reason'] = f"Object match: {', '.join(sorted(label_overlap))}"
             continue
 
+        # Match faces via cosine similarity (dot product of L2-normalized embeddings).
+        # Embeddings from _extract_faces_with_embeddings() are already normalized.
+        best_sim = None
         for query_embedding in signature['face_embeddings']:
             for frame_embedding in frame_face_embeddings:
-                dist = float(np.linalg.norm(query_embedding - frame_embedding))
-                if dist < FACE_MATCH_THRESHOLD:
-                    signature['matched'] = True
-                    signature['first_match_time_sec'] = round(float(timestamp_sec), 2)
-                    signature['match_reason'] = f"Face match (distance={dist:.3f})"
-                    break
-            if signature['matched']:
-                break
+                sim = float(np.dot(query_embedding, frame_embedding))
+                if best_sim is None or sim > best_sim:
+                    best_sim = sim
+        if best_sim is not None and best_sim >= FACE_MATCH_THRESHOLD:
+            signature['matched'] = True
+            signature['first_match_time_sec'] = round(float(timestamp_sec), 2)
+            signature['match_reason'] = f"Face match (cosine_sim={best_sim:.3f})"
+
+MAX_PERSON_SNAPSHOT_SIZE = int(os.environ.get('MAX_PERSON_SNAPSHOT_SIZE', 20))  # max unique persons to snapshot
+
+def _encode_crop_as_base64(frame: np.ndarray, x1: float, y1: float, x2: float, y2: float) -> str | None:
+    """Crop a region from *frame* and encode it as a base64 JPEG string."""
+    h, w = frame.shape[:2]
+    cx1, cy1 = max(0, int(x1)), max(0, int(y1))
+    cx2, cy2 = min(w, int(x2)), min(h, int(y2))
+    if cx2 <= cx1 or cy2 <= cy1:
+        return None
+    crop = frame[cy1:cy2, cx1:cx2]
+    ret, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    if not ret:
+        return None
+    return base64.b64encode(buf.tobytes()).decode('utf-8')
 
 def analyze_video_stream(video_capture, fps, query_signatures=None, restricted_zones=None):
     frame_index = 0
-    object_counts = defaultdict(int)
+    # Use sets of unique track IDs per label for correct "count" (unique individuals)
+    unique_track_ids: dict = defaultdict(set)   # label -> set of track IDs seen
     alerts = []
     alert_keys = set()
     track_state = {}
     heatmap_grid = np.zeros((HEATMAP_GRID_SIZE, HEATMAP_GRID_SIZE), dtype=np.int32)
     processed_frames = 0
     video_duration_sec = 0.0
-    object_timeline = defaultdict(list)  # Track when each object type appears
+    object_timeline = defaultdict(list)  # label -> list of timestamps (deduplicated by >0.5s gap)
+
+    # Person snapshot tracking: keep best-confidence crop per person track_id
+    # Structure: {track_id: {'confidence': float, 'bbox': [...], 'frame': np.ndarray, 'first_seen': float}}
+    person_snapshots: dict = {}
 
     if fps <= 0:
         fps = 25.0
@@ -372,11 +452,13 @@ def analyze_video_stream(video_capture, fps, query_signatures=None, restricted_z
                 confidence = float(box.conf[0])
                 track_id = int(box.id[0]) if box.id is not None else None
                 frame_labels.add(label)
-                object_counts[label] += 1
 
-                # Track timestamp for this object detection
+                # Count unique TRACKS per label, not per-frame detections
+                if track_id is not None:
+                    unique_track_ids[label].add(track_id)
+
+                # Timestamp timeline (deduplicated: only record if >0.5s gap)
                 if not object_timeline[label] or abs(object_timeline[label][-1] - timestamp_sec) > 0.5:
-                    # Only record if first occurrence or >0.5s since last
                     object_timeline[label].append(round(float(timestamp_sec), 2))
 
                 cx, cy = _bbox_center(x1, y1, x2, y2)
@@ -451,8 +533,34 @@ def analyze_video_stream(video_capture, fps, query_signatures=None, restricted_z
                                     'message': f"Person entered restricted zone '{zone.get('name', 'zone')}'"
                                 })
 
+                # --- Person snapshot: store best-confidence crop per track ---
+                if label == 'person' and track_id is not None and len(person_snapshots) <= MAX_PERSON_SNAPSHOT_SIZE:
+                    existing = person_snapshots.get(track_id)
+                    if existing is None or confidence > existing['confidence']:
+                        person_snapshots[track_id] = {
+                            'confidence': confidence,
+                            'bbox': [x1, y1, x2, y2],
+                            'frame': frame.copy(),  # capture frame for later encoding
+                            'first_seen': track_state[track_id]['first_seen'],
+                            'track_id': track_id,
+                        }
+
         if query_signatures:
             _match_queries_in_frame(query_signatures, frame_labels, frame_face_embeddings, timestamp_sec)
+
+    # --- Build tracked_persons: encode best crop per unique person ---
+    tracked_persons = []
+    for track_id, snap in sorted(person_snapshots.items(), key=lambda kv: kv[1]['first_seen']):
+        x1, y1, x2, y2 = snap['bbox']
+        img_b64 = _encode_crop_as_base64(snap['frame'], x1, y1, x2, y2)
+        if img_b64:
+            tracked_persons.append({
+                'track_id': track_id,
+                'first_seen': round(float(snap['first_seen']), 2),
+                'last_seen': round(float(track_state.get(track_id, {}).get('last_seen', snap['first_seen'])), 2),
+                'confidence': round(snap['confidence'], 3),
+                'image': img_b64,  # base64 JPEG
+            })
 
     # Clean query signatures for JSON serialization (remove numpy arrays)
     clean_queries = []
@@ -468,27 +576,37 @@ def analyze_video_stream(video_capture, fps, query_signatures=None, restricted_z
         }
         clean_queries.append(clean_sig)
 
-    # Prepare object detections with timestamps
+    # Prepare object detections with unique-track counts
     object_detections = []
     for label, timestamps in sorted(object_timeline.items()):
+        unique_count = len(unique_track_ids[label]) if unique_track_ids[label] else len(timestamps)
         object_detections.append({
             'label': label,
-            'count': object_counts[label],
-            'timestamps': timestamps[:20],  # Limit to first 20 occurrences
+            'count': unique_count,          # unique individuals/objects (by track ID)
+            'frame_count': sum(            # total frame detections (informational)
+                1 for ts in timestamps     # approximation; timestamps are deduplicated
+            ),
+            'timestamps': timestamps[:20],  # Limit to first 20 time-points
             'first_seen': timestamps[0] if timestamps else None,
             'last_seen': timestamps[-1] if timestamps else None
         })
 
+    # object_counts: unique track counts per label
+    unique_object_counts = {label: len(ids) for label, ids in unique_track_ids.items()}
+
     return {
         'processed_frames': processed_frames,
         'video_duration_sec': round(float(video_duration_sec), 2),
-        'object_counts': dict(sorted(object_counts.items(), key=lambda item: item[1], reverse=True)),
+        'object_counts': dict(sorted(unique_object_counts.items(), key=lambda item: item[1], reverse=True)),
         'object_detections': object_detections,
         'alerts': alerts,
         'alert_count': len(alerts),
         'heatmap': _compute_heatmap_points(heatmap_grid, HEATMAP_GRID_SIZE),
-        'queries': clean_queries
+        'queries': clean_queries,
+        'tracked_persons': tracked_persons,  # NEW: per-person snapshot gallery
     }
+
+
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -623,18 +741,11 @@ def detect():
             return jsonify({'error': 'Invalid image format.'}), 400
 
         height, width, _ = img.shape
-        
-        # Use tracking if requested or by default for video
-        # model.track returns results with .boxes.id
+
+        # Use tracking for persistent IDs across calls
         results = model.track(img, persist=True, conf=0.25, verbose=False)
-        
+
         detections = []
-        
-        # For Face Recognition, we'll also run FaceAnalysis on the whole frame
-        # (Optimally we'd only run it on person crops, but insightface prefers the full frame context for detection)
-        faces = []
-        if face_app:
-            faces = face_app.get(img)
 
         for result in results:
             boxes = result.boxes
@@ -649,53 +760,68 @@ def detect():
                 visitor_name = None
                 
                 # If it's a person, try to match with detected faces
-                if label == 'person' and faces:
-                    # Find face that falls within this person's bounding box
-                    for face in faces:
-                        fx1, fy1, fx2, fy2 = face.bbox.tolist()
-                        # Simple overlap check
+                if label == 'person' and face_app:
+                    # Use _extract_faces_with_embeddings for quality/size/pose filtering
+                    # and to get L2-normalized embeddings ready for cosine comparison.
+                    for face_data in _extract_faces_with_embeddings(img):
+                        fx1, fy1, fx2, fy2 = face_data['bbox']
+                        # Check the face bounding box falls inside this person's box
                         if fx1 >= x1 and fx2 <= x2 and fy1 >= y1 and fy2 <= y2:
-                            embedding = face.embedding.astype('float32')
-                            
-                            # Search in FAISS
+                            embedding = face_data['embedding']  # already normalized
+                            if embedding is None:
+                                continue
+
                             if faiss and faiss_index and faiss_index.ntotal > 0:
                                 D, I = faiss_index.search(np.array([embedding]), 1)
-                                if D[0][0] < 0.6: # Threshold for L2 distance (adjust as needed)
+                                # IndexFlatIP returns cosine similarity; higher = more similar
+                                cosine_sim = float(D[0][0])
+                                logger.debug(f"FAISS cosine_sim={cosine_sim:.3f}")
+                                if cosine_sim >= FACE_MATCH_THRESHOLD:
                                     v_id = visitor_ids[I[0][0]]
                                     visitor_status = "Returning Visitor"
-                                    # Update last seen in DB
                                     conn = get_db_connection()
                                     if conn:
-                                        cur = conn.cursor(cursor_factory=RealDictCursor)
-                                        cur.execute("UPDATE visitors SET last_seen = NOW(), visit_count = visit_count + 1 WHERE id = %s RETURNING name", (v_id,))
-                                        v_row = cur.fetchone()
-                                        visitor_name = v_row['name'] if v_row else "Visitor"
-                                        conn.commit()
-                                        conn.close()
+                                        try:
+                                            cur2 = conn.cursor(cursor_factory=RealDictCursor)
+                                            cur2.execute(
+                                                "UPDATE visitors SET last_seen = NOW(), visit_count = visit_count + 1 WHERE id = %s RETURNING name",
+                                                (v_id,)
+                                            )
+                                            v_row = cur2.fetchone()
+                                            visitor_name = v_row['name'] if v_row else "Visitor"
+                                            conn.commit()
+                                        finally:
+                                            conn.close()
                                 else:
                                     visitor_status = "New Visitor"
-                                    # Add to DB
                                     conn = get_db_connection()
                                     if conn:
-                                        cur = conn.cursor()
-                                        cur.execute("INSERT INTO visitors (embedding) VALUES (%s) RETURNING id", (psycopg2.Binary(embedding.tobytes()),))
-                                        new_id = cur.fetchone()[0]
-                                        conn.commit()
-                                        conn.close()
-                                        # Refresh FAISS
+                                        try:
+                                            cur2 = conn.cursor()
+                                            cur2.execute(
+                                                "INSERT INTO visitors (embedding) VALUES (%s) RETURNING id",
+                                                (psycopg2.Binary(embedding.tobytes()),)
+                                            )
+                                            conn.commit()
+                                        finally:
+                                            conn.close()
                                         load_visitors_into_faiss()
                             else:
+                                # No visitors in index yet — this is always a new visitor
                                 visitor_status = "New Visitor"
-                                # First or no faiss
                                 conn = get_db_connection()
                                 if conn:
-                                    cur = conn.cursor()
-                                    cur.execute("INSERT INTO visitors (embedding) VALUES (%s) RETURNING id", (psycopg2.Binary(embedding.tobytes()),))
-                                    new_id = cur.fetchone()[0]
-                                    conn.commit()
-                                    conn.close()
+                                    try:
+                                        cur2 = conn.cursor()
+                                        cur2.execute(
+                                            "INSERT INTO visitors (embedding) VALUES (%s) RETURNING id",
+                                            (psycopg2.Binary(embedding.tobytes()),)
+                                        )
+                                        conn.commit()
+                                    finally:
+                                        conn.close()
                                     load_visitors_into_faiss()
-                            break # One face per person for now
+                            break  # One face matched per person
 
                 detections.append({
                     'label': label,
@@ -946,14 +1072,14 @@ def process_frame():
                     matched = True
                     match_reason = f"Object match: {', '.join(sorted(label_overlap))}"
                 
-                # Check face matching
+                # Check face matching: cosine similarity >= threshold means same person
                 if not matched:
                     for query_embedding in signature['face_embeddings']:
                         for frame_embedding in frame_face_embeddings:
-                            dist = float(np.linalg.norm(query_embedding - frame_embedding))
-                            if dist < FACE_MATCH_THRESHOLD:
+                            sim = float(np.dot(query_embedding, frame_embedding))
+                            if sim >= FACE_MATCH_THRESHOLD:
                                 matched = True
-                                match_reason = f"Face match (distance={dist:.3f})"
+                                match_reason = f"Face match (cosine_sim={sim:.3f})"
                                 alerts.append({
                                     'type': 'face_match',
                                     'severity': 'high',
@@ -984,10 +1110,92 @@ def process_frame():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/visitors', methods=['GET'])
+def get_visitors():
+    """List all tracked visitors with their metadata."""
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database connection failed'}), 500
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            "SELECT id, name, visit_count, first_seen, last_seen "
+            "FROM visitors ORDER BY last_seen DESC"
+        )
+        rows = cur.fetchall()
+        visitors = []
+        for row in rows:
+            visitors.append({
+                'id': row['id'],
+                'name': row['name'],
+                'visit_count': row['visit_count'],
+                'first_seen': row['first_seen'].isoformat() if row['first_seen'] else None,
+                'last_seen': row['last_seen'].isoformat() if row['last_seen'] else None,
+            })
+        return jsonify({'visitors': visitors, 'total': len(visitors)}), 200
+    except Exception as e:
+        logger.error(f"Get visitors error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/visitors/<int:visitor_id>', methods=['DELETE', 'OPTIONS'])
+def delete_visitor(visitor_id):
+    """Remove a visitor from the database and refresh the FAISS index."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database connection failed'}), 500
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM visitors WHERE id = %s RETURNING id", (visitor_id,))
+        deleted = cur.fetchone()
+        if not deleted:
+            return jsonify({'error': 'Visitor not found'}), 404
+        conn.commit()
+        load_visitors_into_faiss()  # Sync FAISS after deletion
+        return jsonify({'message': f'Visitor {visitor_id} deleted successfully'}), 200
+    except Exception as e:
+        logger.error(f"Delete visitor error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/visitors/<int:visitor_id>/name', methods=['PUT', 'OPTIONS'])
+def rename_visitor(visitor_id):
+    """Assign or update the name of a known visitor."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    data = request.json or {}
+    name = data.get('name', '').strip()
+    if not name:
+        return jsonify({'error': 'name field is required'}), 400
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database connection failed'}), 500
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE visitors SET name = %s WHERE id = %s RETURNING id", (name, visitor_id))
+        updated = cur.fetchone()
+        if not updated:
+            return jsonify({'error': 'Visitor not found'}), 404
+        conn.commit()
+        return jsonify({'message': f'Visitor {visitor_id} renamed to "{name}"'}), 200
+    except Exception as e:
+        logger.error(f"Rename visitor error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+    finally:
+        conn.close()
+
+
 @app.errorhandler(404)
 def not_found(error):
     """Handle 404 errors"""
     return jsonify({'error': 'Endpoint not found'}), 404
+
 
 
 @app.errorhandler(500)

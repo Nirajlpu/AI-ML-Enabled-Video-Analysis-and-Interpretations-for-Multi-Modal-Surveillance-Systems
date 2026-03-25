@@ -34,10 +34,19 @@ export interface HeatmapPoint {
 
 export interface ObjectDetection {
   label: string;
-  count: number;
+  count: number;         // unique individuals / objects by track ID
+  frame_count?: number;  // total sampled-frame detections (informational)
   timestamps: number[];
   first_seen: number | null;
   last_seen: number | null;
+}
+
+export interface TrackedPerson {
+  track_id: number;
+  first_seen: number;
+  last_seen: number;
+  confidence: number;
+  image: string; // base64-encoded JPEG crop
 }
 
 export interface QueryMatchResult {
@@ -58,6 +67,7 @@ export interface VideoAnalyticsResult {
   alerts: VideoAlert[];
   alert_count: number;
   heatmap: HeatmapPoint[];
+  tracked_persons?: TrackedPerson[];  // NEW: per-person snapshot gallery
   queries: Array<{
     query_index: number;
     filename: string;
