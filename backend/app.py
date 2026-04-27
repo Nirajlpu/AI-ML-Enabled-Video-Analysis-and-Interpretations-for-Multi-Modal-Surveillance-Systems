@@ -853,7 +853,7 @@ def get_stats():
         'classes': list(model.names.values()),
         'total_classes': len(model.names)
     }), 200
-
+# main video analysis endpoint
 @app.route('/analyze-video', methods=['POST', 'OPTIONS'])
 def analyze_video():
     """
@@ -910,7 +910,7 @@ def analyze_video():
                 os.unlink(temp_path)
             except Exception:
                 pass
-
+# main query matching endpoint
 @app.route('/match-video-queries', methods=['POST', 'OPTIONS'])
 def match_video_queries():
     """
