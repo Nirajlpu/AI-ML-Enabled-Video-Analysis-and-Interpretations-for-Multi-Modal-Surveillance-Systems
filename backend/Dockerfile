@@ -8,6 +8,8 @@ ENV YOLO_CONFIG_DIR=/tmp
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3-dev \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
