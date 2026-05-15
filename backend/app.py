@@ -184,6 +184,40 @@ SUSPICIOUS_OBJECT_KEYWORDS = {
 }
 
 # ---------------------------------------------------------------------------
+# Live Monitor Session State
+# ---------------------------------------------------------------------------
+import uuid
+import time as _time
+import json as _json
+import threading
+
+# Number of consecutive frame-misses before a query subject is considered "left"
+PRESENCE_MISS_TOLERANCE = int(os.environ.get('PRESENCE_MISS_TOLERANCE', 3))
+
+# session_id -> { 'query_signatures': [...], 'presence': { idx: {...} }, 'created_at': float }
+live_monitor_sessions: dict = {}
+_session_lock = threading.Lock()
+
+
+def _init_presence_entry():
+    """Create a fresh presence tracking record for one query."""
+    return {
+        'is_present': False,
+        'first_seen_at': None,       # ISO wall-clock timestamp
+        'last_seen_at': None,        # ISO wall-clock timestamp
+        'continuous_since': None,    # ISO wall-clock timestamp (start of current segment)
+        'left_at': None,             # ISO wall-clock timestamp
+        'total_presence_sec': 0.0,   # accumulated duration
+        'miss_counter': 0,
+        'segments': [],              # list of {start, end, duration_sec}
+        'match_reason': None,
+    }
+
+
+def _now_iso():
+    return datetime.datetime.now().isoformat()
+
+# ---------------------------------------------------------------------------
 # Embedding utilities
 # ---------------------------------------------------------------------------
 
@@ -369,13 +403,38 @@ def _match_queries_in_frame(query_signatures, frame_labels, frame_face_embedding
         if signature.get('error'):
             continue
 
-        # Only match by object label if it's not just 'person' (avoid confusing person detection with face match)
-        label_overlap = set(signature['labels']).intersection(frame_labels)
-        if label_overlap and not (label_overlap == {'person'}):
-            signature['matched'] = True
-            signature['first_match_time_sec'] = round(float(timestamp_sec), 2)
-            signature['match_reason'] = f"Object match: {', '.join(sorted(label_overlap))}"
-            continue
+        # Matching Logic:
+        # 1. If query has faces -> REQUIRE face match (strict).
+        # 2. If query has NO faces -> Allow object label match.
+        
+        has_query_face = len(signature.get('face_embeddings', [])) > 0
+        
+        if has_query_face:
+            # STRICT FACE MATCHING
+            best_sim = None
+            for query_embedding in signature['face_embeddings']:
+                for frame_embedding in frame_face_embeddings:
+                    sim = float(np.dot(query_embedding, frame_embedding))
+                    if best_sim is None or sim > best_sim:
+                        best_sim = sim
+            
+            if best_sim is not None and best_sim >= FACE_MATCH_THRESHOLD:
+                signature['matched'] = True
+                signature['first_match_time_sec'] = round(float(timestamp_sec), 2)
+                signature['match_reason'] = f"Face match (sim={best_sim:.3f})"
+                continue
+        else:
+            # OBJECT LABEL MATCHING
+            label_overlap = set(signature['labels']).intersection(frame_labels)
+            if label_overlap:
+                if label_overlap == {'person'}:
+                    # Skip generic person match if query was intended to be a person but no face found
+                    pass
+                else:
+                    signature['matched'] = True
+                    signature['first_match_time_sec'] = round(float(timestamp_sec), 2)
+                    signature['match_reason'] = f"Object match: {', '.join(sorted(label_overlap))}"
+                    continue
 
         # Match faces via cosine similarity (dot product of L2-normalized embeddings).
         # Embeddings from _extract_faces_with_embeddings() are already normalized.
@@ -1189,6 +1248,419 @@ def rename_visitor(visitor_id):
         return jsonify({'error': 'Internal server error'}), 500
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Live Monitor Session Endpoints
+# ---------------------------------------------------------------------------
+
+@app.route('/live-monitor/start-session', methods=['POST', 'OPTIONS'])
+def live_monitor_start_session():
+    """
+    Start a live-monitor session with query images.
+    Request (multipart/form-data):
+      - query_images: one or more image files
+    Returns:
+      - session_id: unique session identifier
+      - queries: extracted signatures summary
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    if model is None:
+        return jsonify({'error': 'Model not loaded'}), 503
+
+    query_images = request.files.getlist('query_images')
+    if not query_images:
+        return jsonify({'error': 'No query_images provided'}), 400
+
+    try:
+        query_signatures = _extract_query_signatures(query_images)
+        session_id = str(uuid.uuid4())
+
+        presence = {}
+        for idx, sig in enumerate(query_signatures):
+            presence[idx] = _init_presence_entry()
+
+        with _session_lock:
+            live_monitor_sessions[session_id] = {
+                'query_signatures': query_signatures,
+                'presence': presence,
+                'alerts': [],
+                'created_at': _time.time(),
+            }
+
+        logger.info(f"Session {session_id} started. Queries:")
+        for i, sig in enumerate(query_signatures):
+            logger.info(f"  [{i}] {sig.get('filename')} -> Labels: {sig.get('labels')}, Faces: {len(sig.get('face_embeddings', []))}")
+
+        # Prepare a JSON-safe summary
+        queries_summary = []
+        for sig in query_signatures:
+            queries_summary.append({
+                'query_index': sig.get('query_index'),
+                'filename': sig.get('filename'),
+                'labels': sig.get('labels', []),
+                'has_face': len(sig.get('face_embeddings', [])) > 0,
+                'error': sig.get('error'),
+            })
+
+        logger.info(f"Live monitor session started: {session_id} with {len(query_signatures)} queries")
+
+        return jsonify({
+            'status': 'success',
+            'session_id': session_id,
+            'queries': queries_summary,
+        }), 200
+    except Exception as e:
+        logger.error(f"Start session error: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/live-monitor/process-frame', methods=['POST', 'OPTIONS'])
+def live_monitor_process_frame():
+    """
+    Process a single webcam frame within a live-monitor session.
+    Request (multipart/form-data):
+      - session_id: required (form field)
+      - frame: required image file (JPEG/PNG)
+    Returns:
+      - detections, alerts, query_presence (per-query live status)
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    if model is None:
+        return jsonify({'error': 'Model not loaded'}), 503
+
+    session_id = request.form.get('session_id', '').strip()
+    frame_file = request.files.get('frame')
+
+    if not frame_file:
+        return jsonify({'error': 'No frame provided'}), 400
+
+    # If no session_id, fall back to stateless frame processing
+    session = None
+    if session_id:
+        with _session_lock:
+            session = live_monitor_sessions.get(session_id)
+        if not session:
+            return jsonify({'error': 'Invalid or expired session_id'}), 404
+
+    try:
+        # Decode frame
+        img_bytes = frame_file.read()
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return jsonify({'error': 'Invalid frame format'}), 400
+
+        frame_h, frame_w = frame.shape[:2]
+
+        # --- YOLO detection ---
+        results = model.predict(frame, conf=0.25, verbose=False)
+        detections = []
+        frame_alerts = []
+        frame_labels = set()
+
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                cls = int(box.cls[0])
+                label = model.names[cls]
+                confidence = float(box.conf[0])
+                frame_labels.add(label)
+
+                detections.append({
+                    'label': label,
+                    'confidence': round(confidence, 3),
+                    'box': {
+                        'x': round(x1 / frame_w, 4),
+                        'y': round(y1 / frame_h, 4),
+                        'width': round((x2 - x1) / frame_w, 4),
+                        'height': round((y2 - y1) / frame_h, 4),
+                    },
+                    'is_query_match': False,
+                })
+
+                # Suspicious object alerts
+                if label.lower() in SUSPICIOUS_OBJECT_KEYWORDS:
+                    frame_alerts.append({
+                        'type': 'suspicious_object',
+                        'severity': 'high',
+                        'message': f"Suspicious object detected: {label}",
+                        'timestamp': _now_iso(),
+                    })
+
+        # --- Face embeddings for this frame ---
+        faces = _extract_faces_with_embeddings(frame)
+        frame_face_embeddings = [f['embedding'] for f in faces if f['embedding'] is not None]
+
+        # --- Query presence tracking (session-based) ---
+        query_presence = []
+        session_alerts = []
+
+        if session:
+            query_signatures = session['query_signatures']
+            presence_map = session['presence']
+            now_str = _now_iso()
+            now_ts = _time.time()
+
+            for idx, signature in enumerate(query_signatures):
+                if signature.get('error'):
+                    query_presence.append({
+                        'query_index': idx,
+                        'filename': signature.get('filename'),
+                        'error': signature.get('error'),
+                        'is_present': False,
+                    })
+                    continue
+
+                pstate = presence_map.get(idx, _init_presence_entry())
+
+                # --- Check if this query matches the current frame ---
+                matched = False
+                match_reason = None
+
+                # Matching Logic:
+                # 1. If query has faces -> REQUIRE face match (strict).
+                # 2. If query has NO faces -> Allow object label match (e.g. for dogs, backpacks).
+                
+                has_query_face = len(signature.get('face_embeddings', [])) > 0
+                matched = False
+                match_reason = None
+
+                if has_query_face:
+                    # STRICT FACE MATCHING
+                    if frame_face_embeddings:
+                        best_sim = None
+                        for q_emb in signature['face_embeddings']:
+                            for f_emb in frame_face_embeddings:
+                                sim = float(np.dot(q_emb, f_emb))
+                                if best_sim is None or sim > best_sim:
+                                    best_sim = sim
+                        
+                        if best_sim is not None and best_sim >= FACE_MATCH_THRESHOLD:
+                            matched = True
+                            match_reason = f"Face match (sim={best_sim:.3f})"
+                            # Highlight the person
+                            for det in detections:
+                                if det['label'] == 'person':
+                                    det['is_query_match'] = True
+                else:
+                    # OBJECT LABEL MATCHING (for non-face queries)
+                    label_overlap = set(signature.get('labels', [])).intersection(frame_labels)
+                    if label_overlap:
+                        # Still exclude lone 'person' if no face was found in query image 
+                        # to avoid matching every person when the query was intended to be a person
+                        if label_overlap == {'person'}:
+                             matched = False 
+                        else:
+                            matched = True
+                            match_reason = f"Object match: {', '.join(sorted(label_overlap))}"
+                            for det in detections:
+                                if det['label'] in label_overlap:
+                                    det['is_query_match'] = True
+                
+                if matched:
+                    logger.info(f"MATCH FOUND for session {session_id}, query {idx}: {match_reason}")
+
+                # --- Update presence state ---
+                if matched:
+                    pstate['miss_counter'] = 0
+                    pstate['last_seen_at'] = now_str
+                    pstate['match_reason'] = match_reason
+
+                    if not pstate['is_present']:
+                        # APPEARED
+                        pstate['is_present'] = True
+                        pstate['continuous_since'] = now_str
+                        pstate['left_at'] = None
+                        if pstate['first_seen_at'] is None:
+                            pstate['first_seen_at'] = now_str
+
+                        alert_msg = {
+                            'type': 'query_match',
+                            'severity': 'high',
+                            'message': f"🔍 MATCH: '{signature.get('filename', f'Query {idx}')}' appeared! ({match_reason})",
+                            'timestamp': now_str,
+                            'query_index': idx,
+                            'event': 'appeared',
+                        }
+                        session_alerts.append(alert_msg)
+                        frame_alerts.append(alert_msg)
+                else:
+                    # Not matched this frame
+                    pstate['miss_counter'] = pstate.get('miss_counter', 0) + 1
+
+                    if pstate['is_present'] and pstate['miss_counter'] >= PRESENCE_MISS_TOLERANCE:
+                        # LEFT
+                        pstate['is_present'] = False
+                        pstate['left_at'] = now_str
+
+                        # Calculate segment duration
+                        seg_start = pstate.get('continuous_since', now_str)
+                        try:
+                            dt_start = datetime.datetime.fromisoformat(seg_start)
+                            dt_end = datetime.datetime.fromisoformat(now_str)
+                            seg_duration = (dt_end - dt_start).total_seconds()
+                        except Exception:
+                            seg_duration = 0.0
+
+                        pstate['total_presence_sec'] = pstate.get('total_presence_sec', 0.0) + seg_duration
+                        pstate['segments'].append({
+                            'start': seg_start,
+                            'end': now_str,
+                            'duration_sec': round(seg_duration, 1),
+                        })
+                        pstate['continuous_since'] = None
+
+                        # Format duration
+                        mins = int(seg_duration // 60)
+                        secs = int(seg_duration % 60)
+                        dur_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+
+                        alert_msg = {
+                            'type': 'query_left',
+                            'severity': 'medium',
+                            'message': f"👋 LEFT: '{signature.get('filename', f'Query {idx}')}' left after {dur_str}",
+                            'timestamp': now_str,
+                            'query_index': idx,
+                            'event': 'left',
+                            'duration_sec': round(seg_duration, 1),
+                        }
+                        session_alerts.append(alert_msg)
+                        frame_alerts.append(alert_msg)
+
+                presence_map[idx] = pstate
+
+                # Build response entry
+                # Calculate current segment duration if still present
+                current_seg_duration = 0.0
+                if pstate['is_present'] and pstate.get('continuous_since'):
+                    try:
+                        dt_start = datetime.datetime.fromisoformat(pstate['continuous_since'])
+                        dt_now = datetime.datetime.now()
+                        current_seg_duration = (dt_now - dt_start).total_seconds()
+                    except Exception:
+                        pass
+
+                query_presence.append({
+                    'query_index': idx,
+                    'filename': signature.get('filename'),
+                    'is_present': pstate['is_present'],
+                    'first_seen_at': pstate['first_seen_at'],
+                    'last_seen_at': pstate['last_seen_at'],
+                    'continuous_since': pstate['continuous_since'],
+                    'left_at': pstate['left_at'],
+                    'total_presence_sec': round(pstate.get('total_presence_sec', 0.0) + current_seg_duration, 1),
+                    'current_segment_sec': round(current_seg_duration, 1),
+                    'segments': pstate.get('segments', []),
+                    'match_reason': pstate.get('match_reason'),
+                })
+
+            # Persist alerts to session
+            if session_alerts:
+                session['alerts'].extend(session_alerts)
+
+        return jsonify({
+            'status': 'success',
+            'detections': detections,
+            'alerts': frame_alerts,
+            'alert_count': len(frame_alerts),
+            'query_presence': query_presence,
+            'frame_dimensions': {'width': frame_w, 'height': frame_h},
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Live monitor frame error: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/live-monitor/stop-session', methods=['POST', 'OPTIONS'])
+def live_monitor_stop_session():
+    """
+    Stop a live-monitor session and return the final summary.
+    Request (JSON or form):
+      - session_id: required
+    Returns:
+      - Final presence summary per query with all segments
+      - All alerts from the session
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    session_id = None
+    if request.is_json:
+        session_id = (request.json or {}).get('session_id', '').strip()
+    else:
+        session_id = request.form.get('session_id', '').strip()
+
+    if not session_id:
+        return jsonify({'error': 'session_id is required'}), 400
+
+    with _session_lock:
+        session = live_monitor_sessions.pop(session_id, None)
+
+    if not session:
+        return jsonify({'error': 'Invalid or expired session_id'}), 404
+
+    try:
+        now_str = _now_iso()
+        query_summaries = []
+
+        for idx, signature in enumerate(session['query_signatures']):
+            pstate = session['presence'].get(idx, {})
+
+            # If still present at stop time, close the segment
+            if pstate.get('is_present') and pstate.get('continuous_since'):
+                try:
+                    dt_start = datetime.datetime.fromisoformat(pstate['continuous_since'])
+                    dt_end = datetime.datetime.now()
+                    seg_duration = (dt_end - dt_start).total_seconds()
+                except Exception:
+                    seg_duration = 0.0
+
+                pstate['total_presence_sec'] = pstate.get('total_presence_sec', 0.0) + seg_duration
+                pstate['segments'].append({
+                    'start': pstate['continuous_since'],
+                    'end': now_str,
+                    'duration_sec': round(seg_duration, 1),
+                })
+                pstate['is_present'] = False
+                pstate['left_at'] = now_str
+
+            total_sec = pstate.get('total_presence_sec', 0.0)
+            mins = int(total_sec // 60)
+            secs = int(total_sec % 60)
+            dur_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+
+            query_summaries.append({
+                'query_index': idx,
+                'filename': signature.get('filename'),
+                'labels': signature.get('labels', []),
+                'was_found': pstate.get('first_seen_at') is not None,
+                'first_seen_at': pstate.get('first_seen_at'),
+                'last_seen_at': pstate.get('last_seen_at'),
+                'total_presence_sec': round(total_sec, 1),
+                'total_presence_formatted': dur_str,
+                'segments': pstate.get('segments', []),
+                'match_reason': pstate.get('match_reason'),
+                'error': signature.get('error'),
+            })
+
+        return jsonify({
+            'status': 'success',
+            'session_id': session_id,
+            'queries': query_summaries,
+            'alerts': session.get('alerts', []),
+            'total_alerts': len(session.get('alerts', [])),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Stop session error: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 
 @app.errorhandler(404)
