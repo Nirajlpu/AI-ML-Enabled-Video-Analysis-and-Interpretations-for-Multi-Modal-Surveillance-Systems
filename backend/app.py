@@ -15,10 +15,10 @@ from psycopg2.extras import RealDictCursor
 import tempfile
 from collections import defaultdict
 
-# Load environment variables
+
 load_dotenv()
 
-# Configure logging
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -32,16 +32,16 @@ except ImportError:
     faiss = None
     FaceAnalysis = None
     logger.warning("⚠️ faiss or insightface not installed. Face recognition features will be disabled.")
-# Reduce Flask's werkzeug logging noise
+
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-# Initialize Flask app
+
 app = Flask(__name__)
 
-# Get allowed origins from env or use default localhosts
+
 allowed_origins = os.environ.get('ALLOWED_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:5001,http://127.0.0.1:5001,http://localhost:8000,http://127.0.0.1:8000,http://localhost:8001,http://127.0.0.1:8001,https://ai-ml-enabled-video-analysis-and-interpretations-dj2tr2q06.vercel.app,*,https://ai-ml-enabled-video-analysis-and-in.vercel.app').split(',')
 
-CORS(app, 
+CORS(app,  
      origins=allowed_origins,
      supports_credentials=True,
      allow_headers=['Content-Type', 'Authorization'],
@@ -51,7 +51,7 @@ CORS(app,
 @app.after_request
 def after_request(response):
     origin = request.headers.get('Origin')
-    # Allow all configured origins
+   
     if origin and origin in allowed_origins:
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Credentials'] = 'true'
@@ -59,7 +59,7 @@ def after_request(response):
     response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
     return response
 
-# Database configuration
+
 DATABASE_URL = os.environ.get('DATABASE_URL')
 JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key')
 
@@ -78,7 +78,7 @@ def init_db():
     
     try:
         cur = conn.cursor()
-        # Create users table
+        
         cur.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -89,7 +89,7 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Create detections table (optional, for logging)
+        
         cur.execute('''
             CREATE TABLE IF NOT EXISTS detections (
                 id SERIAL PRIMARY KEY,
@@ -99,7 +99,7 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Create visitors table
+        
         cur.execute('''
             CREATE TABLE IF NOT EXISTS visitors (
                 id SERIAL PRIMARY KEY,
@@ -118,10 +118,10 @@ def init_db():
         cur.close()
         conn.close()
 
-# Initialize DB
+
 init_db()
 
-# Load YOLO model
+
 MODEL_PATH = os.environ.get('YOLO_MODEL_PATH', 'yolo11n.pt')
 model = None
 
@@ -146,7 +146,7 @@ except Exception as e:
     logger.error(f"❌ Failed to load YOLO model: {e}")
     model = None
 
-# Initialize Face Analysis (ArcFace)
+
 face_app = None
 try:
     logger.info("Initializing FaceAnalysis (ArcFace)...")
@@ -156,26 +156,21 @@ try:
 except Exception as e:
     logger.error(f"❌ Failed to initialize FaceAnalysis: {e}")
 
-# FAISS Index setup
-EMBEDDING_DIM = 512 # ArcFace buffalo_l produces 512-d embeddings
-# Use Inner Product index — after L2-normalizing embeddings this equals cosine similarity.
-# This is the correct index for ArcFace / InsightFace embeddings.
-faiss_index = faiss.IndexFlatIP(EMBEDDING_DIM) if faiss else None
-visitor_ids = [] # To map FAISS index to visitor DB IDs
 
-# Video analytics configuration
+EMBEDDING_DIM = 512 
+
+faiss_index = faiss.IndexFlatIP(EMBEDDING_DIM) if faiss else None
+visitor_ids = [] 
 VIDEO_SAMPLE_EVERY_N_FRAMES = int(os.environ.get('VIDEO_SAMPLE_EVERY_N_FRAMES', 5))
 LOITERING_SECONDS = int(os.environ.get('LOITERING_SECONDS', 12))
 SUSPICIOUS_SPEED_PX = float(os.environ.get('SUSPICIOUS_SPEED_PX', 60.0))
-# Cosine similarity threshold for ArcFace.
-# After L2-normalizing embeddings, dot-product == cosine similarity.
-# Two faces with cosine_sim >= threshold are considered the same person.
-# Range: 0.0 (no match) to 1.0 (identical). 0.40 is a safe starting point.
+
+
 FACE_MATCH_THRESHOLD = float(os.environ.get('FACE_MATCH_THRESHOLD', 0.40))
-# Minimum face detection confidence score (InsightFace det_score field)
+
 FACE_QUALITY_THRESHOLD = float(os.environ.get('FACE_QUALITY_THRESHOLD', 0.70))
-# Minimum face bounding-box area in pixels to avoid tiny/noisy detections
-FACE_MIN_AREA_PX = int(os.environ.get('FACE_MIN_AREA_PX', 1600))  # 40x40 px
+
+FACE_MIN_AREA_PX = int(os.environ.get('FACE_MIN_AREA_PX', 1600))  
 HEATMAP_GRID_SIZE = int(os.environ.get('HEATMAP_GRID_SIZE', 20))
 MAX_QUERY_IMAGES = int(os.environ.get('MAX_QUERY_IMAGES', 20))
 
@@ -184,32 +179,30 @@ SUSPICIOUS_OBJECT_KEYWORDS = {
 }
 
 # ---------------------------------------------------------------------------
-# Live Monitor Session State
-# ---------------------------------------------------------------------------
+
 import uuid
 import time as _time
 import json as _json
 import threading
 
-# Number of consecutive frame-misses before a query subject is considered "left"
+
 PRESENCE_MISS_TOLERANCE = int(os.environ.get('PRESENCE_MISS_TOLERANCE', 3))
 
-# session_id -> { 'query_signatures': [...], 'presence': { idx: {...} }, 'created_at': float }
+
 live_monitor_sessions: dict = {}
 _session_lock = threading.Lock()
 
 
 def _init_presence_entry():
-    """Create a fresh presence tracking record for one query."""
     return {
         'is_present': False,
-        'first_seen_at': None,       # ISO wall-clock timestamp
-        'last_seen_at': None,        # ISO wall-clock timestamp
-        'continuous_since': None,    # ISO wall-clock timestamp (start of current segment)
-        'left_at': None,             # ISO wall-clock timestamp
-        'total_presence_sec': 0.0,   # accumulated duration
+        'first_seen_at': None,       
+        'last_seen_at': None,       
+        'continuous_since': None,   
+        'left_at': None,            
+        'total_presence_sec': 0.0,  
         'miss_counter': 0,
-        'segments': [],              # list of {start, end, duration_sec}
+        'segments': [],             
         'match_reason': None,
     }
 
@@ -217,9 +210,7 @@ def _init_presence_entry():
 def _now_iso():
     return datetime.datetime.now().isoformat()
 
-# ---------------------------------------------------------------------------
-# Embedding utilities
-# ---------------------------------------------------------------------------
+
 
 def normalize_embedding(emb: np.ndarray) -> np.ndarray:
     """L2-normalize an ArcFace embedding so dot-product == cosine similarity."""
@@ -246,7 +237,7 @@ def load_visitors_into_faiss():
             visitor_ids = []
             for row in rows:
                 raw = np.frombuffer(row[1], dtype=np.float32).copy()
-                # Always normalize so the IndexFlatIP gives cosine similarity scores
+                
                 emb = normalize_embedding(raw)
                 embeddings.append(emb)
                 visitor_ids.append(row[0])
@@ -298,26 +289,21 @@ def _extract_faces_with_embeddings(frame):
         for face in faces:
             fx1, fy1, fx2, fy2 = face.bbox.tolist()
 
-            # --- Quality filter 1: minimum detection confidence ---
-            det_score = getattr(face, 'det_score', 1.0)  # default 1.0 if field absent
+            det_score = getattr(face, 'det_score', 1.0) 
             if det_score < FACE_QUALITY_THRESHOLD:
                 logger.debug(f"Skipping low-quality face det_score={det_score:.2f}")
                 continue
-
-            # --- Quality filter 2: minimum bounding box area ---
             face_area = max(0, fx2 - fx1) * max(0, fy2 - fy1)
             if face_area < FACE_MIN_AREA_PX:
                 logger.debug(f"Skipping tiny face area={face_area:.0f}px")
                 continue
 
-            # --- Pose filter: only approximately front-facing faces ---
             if hasattr(face, 'pose') and face.pose is not None:
                 yaw, pitch, roll = face.pose
-                if abs(yaw) > 35 or abs(pitch) > 35:  # slightly relaxed from 20° to handle natural head tilt
+                if abs(yaw) > 35 or abs(pitch) > 35: 
                     logger.debug(f"Skipping non-frontal face yaw={yaw:.1f} pitch={pitch:.1f}")
                     continue
 
-            # --- Normalize embedding for cosine-similarity comparison ---
             raw_emb = face.embedding if hasattr(face, 'embedding') else None
             norm_emb = normalize_embedding(raw_emb.astype('float32')) if raw_emb is not None else None
 
@@ -403,14 +389,11 @@ def _match_queries_in_frame(query_signatures, frame_labels, frame_face_embedding
         if signature.get('error'):
             continue
 
-        # Matching Logic:
-        # 1. If query has faces -> REQUIRE face match (strict).
-        # 2. If query has NO faces -> Allow object label match.
+
         
         has_query_face = len(signature.get('face_embeddings', [])) > 0
         
         if has_query_face:
-            # STRICT FACE MATCHING
             best_sim = None
             for query_embedding in signature['face_embeddings']:
                 for frame_embedding in frame_face_embeddings:
@@ -424,11 +407,10 @@ def _match_queries_in_frame(query_signatures, frame_labels, frame_face_embedding
                 signature['match_reason'] = f"Face match (sim={best_sim:.3f})"
                 continue
         else:
-            # OBJECT LABEL MATCHING
+
             label_overlap = set(signature['labels']).intersection(frame_labels)
             if label_overlap:
                 if label_overlap == {'person'}:
-                    # Skip generic person match if query was intended to be a person but no face found
                     pass
                 else:
                     signature['matched'] = True
@@ -436,8 +418,7 @@ def _match_queries_in_frame(query_signatures, frame_labels, frame_face_embedding
                     signature['match_reason'] = f"Object match: {', '.join(sorted(label_overlap))}"
                     continue
 
-        # Match faces via cosine similarity (dot product of L2-normalized embeddings).
-        # Embeddings from _extract_faces_with_embeddings() are already normalized.
+
         best_sim = None
         for query_embedding in signature['face_embeddings']:
             for frame_embedding in frame_face_embeddings:
@@ -449,7 +430,7 @@ def _match_queries_in_frame(query_signatures, frame_labels, frame_face_embedding
             signature['first_match_time_sec'] = round(float(timestamp_sec), 2)
             signature['match_reason'] = f"Face match (cosine_sim={best_sim:.3f})"
 
-MAX_PERSON_SNAPSHOT_SIZE = int(os.environ.get('MAX_PERSON_SNAPSHOT_SIZE', 20))  # max unique persons to snapshot
+MAX_PERSON_SNAPSHOT_SIZE = int(os.environ.get('MAX_PERSON_SNAPSHOT_SIZE', 20))  
 
 def _encode_crop_as_base64(frame: np.ndarray, x1: float, y1: float, x2: float, y2: float) -> str | None:
     """Crop a region from *frame* and encode it as a base64 JPEG string."""
@@ -466,18 +447,16 @@ def _encode_crop_as_base64(frame: np.ndarray, x1: float, y1: float, x2: float, y
 
 def analyze_video_stream(video_capture, fps, query_signatures=None, restricted_zones=None):
     frame_index = 0
-    # Use sets of unique track IDs per label for correct "count" (unique individuals)
-    unique_track_ids: dict = defaultdict(set)   # label -> set of track IDs seen
+
+    unique_track_ids: dict = defaultdict(set) 
     alerts = []
     alert_keys = set()
     track_state = {}
     heatmap_grid = np.zeros((HEATMAP_GRID_SIZE, HEATMAP_GRID_SIZE), dtype=np.int32)
     processed_frames = 0
     video_duration_sec = 0.0
-    object_timeline = defaultdict(list)  # label -> list of timestamps (deduplicated by >0.5s gap)
+    object_timeline = defaultdict(list)  
 
-    # Person snapshot tracking: keep best-confidence crop per person track_id
-    # Structure: {track_id: {'confidence': float, 'bbox': [...], 'frame': np.ndarray, 'first_seen': float}}
     person_snapshots: dict = {}
 
     if fps <= 0:
@@ -512,11 +491,10 @@ def analyze_video_stream(video_capture, fps, query_signatures=None, restricted_z
                 track_id = int(box.id[0]) if box.id is not None else None
                 frame_labels.add(label)
 
-                # Count unique TRACKS per label, not per-frame detections
+ 
                 if track_id is not None:
                     unique_track_ids[label].add(track_id)
 
-                # Timestamp timeline (deduplicated: only record if >0.5s gap)
                 if not object_timeline[label] or abs(object_timeline[label][-1] - timestamp_sec) > 0.5:
                     object_timeline[label].append(round(float(timestamp_sec), 2))
 
@@ -592,14 +570,14 @@ def analyze_video_stream(video_capture, fps, query_signatures=None, restricted_z
                                     'message': f"Person entered restricted zone '{zone.get('name', 'zone')}'"
                                 })
 
-                # --- Person snapshot: store best-confidence crop per track ---
+    
                 if label == 'person' and track_id is not None and len(person_snapshots) <= MAX_PERSON_SNAPSHOT_SIZE:
                     existing = person_snapshots.get(track_id)
                     if existing is None or confidence > existing['confidence']:
                         person_snapshots[track_id] = {
                             'confidence': confidence,
                             'bbox': [x1, y1, x2, y2],
-                            'frame': frame.copy(),  # capture frame for later encoding
+                            'frame': frame.copy(),  
                             'first_seen': track_state[track_id]['first_seen'],
                             'track_id': track_id,
                         }
@@ -607,7 +585,6 @@ def analyze_video_stream(video_capture, fps, query_signatures=None, restricted_z
         if query_signatures:
             _match_queries_in_frame(query_signatures, frame_labels, frame_face_embeddings, timestamp_sec)
 
-    # --- Build tracked_persons: encode best crop per unique person ---
     tracked_persons = []
     for track_id, snap in sorted(person_snapshots.items(), key=lambda kv: kv[1]['first_seen']):
         x1, y1, x2, y2 = snap['bbox']
@@ -621,7 +598,6 @@ def analyze_video_stream(video_capture, fps, query_signatures=None, restricted_z
                 'image': img_b64,  # base64 JPEG
             })
 
-    # Clean query signatures for JSON serialization (remove numpy arrays)
     clean_queries = []
     for sig in (query_signatures or []):
         clean_sig = {
@@ -635,22 +611,21 @@ def analyze_video_stream(video_capture, fps, query_signatures=None, restricted_z
         }
         clean_queries.append(clean_sig)
 
-    # Prepare object detections with unique-track counts
     object_detections = []
     for label, timestamps in sorted(object_timeline.items()):
         unique_count = len(unique_track_ids[label]) if unique_track_ids[label] else len(timestamps)
         object_detections.append({
             'label': label,
-            'count': unique_count,          # unique individuals/objects (by track ID)
-            'frame_count': sum(            # total frame detections (informational)
-                1 for ts in timestamps     # approximation; timestamps are deduplicated
+            'count': unique_count,
+            'frame_count': sum(            
+                1 for ts in timestamps    
             ),
-            'timestamps': timestamps[:20],  # Limit to first 20 time-points
+            'timestamps': timestamps[:20],
             'first_seen': timestamps[0] if timestamps else None,
             'last_seen': timestamps[-1] if timestamps else None
         })
 
-    # object_counts: unique track counts per label
+
     unique_object_counts = {label: len(ids) for label, ids in unique_track_ids.items()}
 
     return {
@@ -662,7 +637,7 @@ def analyze_video_stream(video_capture, fps, query_signatures=None, restricted_z
         'alert_count': len(alerts),
         'heatmap': _compute_heatmap_points(heatmap_grid, HEATMAP_GRID_SIZE),
         'queries': clean_queries,
-        'tracked_persons': tracked_persons,  # NEW: per-person snapshot gallery
+        'tracked_persons': tracked_persons,  
     }
 
 
@@ -691,7 +666,6 @@ def register():
     if not email or not password:
         return jsonify({'error': 'Email and password are required'}), 400
 
-    # Use werkzeug for password hashing
     try:
         hashed_password = generate_password_hash(password)
     except Exception as e:
@@ -801,7 +775,6 @@ def detect():
 
         height, width, _ = img.shape
 
-        # Use tracking for persistent IDs across calls
         results = model.track(img, persist=True, conf=0.25, verbose=False)
 
         detections = []
@@ -818,21 +791,20 @@ def detect():
                 visitor_status = "Unknown"
                 visitor_name = None
                 
-                # If it's a person, try to match with detected faces
+                
                 if label == 'person' and face_app:
-                    # Use _extract_faces_with_embeddings for quality/size/pose filtering
-                    # and to get L2-normalized embeddings ready for cosine comparison.
+                 
                     for face_data in _extract_faces_with_embeddings(img):
                         fx1, fy1, fx2, fy2 = face_data['bbox']
-                        # Check the face bounding box falls inside this person's box
+                      
                         if fx1 >= x1 and fx2 <= x2 and fy1 >= y1 and fy2 <= y2:
-                            embedding = face_data['embedding']  # already normalized
+                            embedding = face_data['embedding'] 
                             if embedding is None:
                                 continue
 
                             if faiss and faiss_index and faiss_index.ntotal > 0:
                                 D, I = faiss_index.search(np.array([embedding]), 1)
-                                # IndexFlatIP returns cosine similarity; higher = more similar
+
                                 cosine_sim = float(D[0][0])
                                 logger.debug(f"FAISS cosine_sim={cosine_sim:.3f}")
                                 if cosine_sim >= FACE_MATCH_THRESHOLD:
@@ -866,7 +838,6 @@ def detect():
                                             conn.close()
                                         load_visitors_into_faiss()
                             else:
-                                # No visitors in index yet — this is always a new visitor
                                 visitor_status = "New Visitor"
                                 conn = get_db_connection()
                                 if conn:
@@ -880,7 +851,7 @@ def detect():
                                     finally:
                                         conn.close()
                                     load_visitors_into_faiss()
-                            break  # One face matched per person
+                            break  
 
                 detections.append({
                     'label': label,
@@ -912,7 +883,7 @@ def get_stats():
         'classes': list(model.names.values()),
         'total_classes': len(model.names)
     }), 200
-# main video analysis endpoint
+
 @app.route('/analyze-video', methods=['POST', 'OPTIONS'])
 def analyze_video():
     """
@@ -969,7 +940,6 @@ def analyze_video():
                 os.unlink(temp_path)
             except Exception:
                 pass
-# main query matching endpoint
 @app.route('/match-video-queries', methods=['POST', 'OPTIONS'])
 def match_video_queries():
     """
@@ -1058,7 +1028,6 @@ def process_frame():
     query_images = request.files.getlist('query_images')
 
     try:
-        # Read frame
         img_bytes = frame_file.read()
         nparr = np.frombuffer(img_bytes, np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -1068,7 +1037,6 @@ def process_frame():
 
         frame_h, frame_w = frame.shape[:2]
         
-        # Run YOLO detection
         results = model.predict(frame, conf=0.25, verbose=False)
         
         detections = []
@@ -1085,7 +1053,6 @@ def process_frame():
                 confidence = float(box.conf[0])
                 frame_labels.add(label)
                 
-                # Normalized coordinates
                 detections.append({
                     'label': label,
                     'confidence': round(confidence, 3),
@@ -1097,7 +1064,6 @@ def process_frame():
                     }
                 })
                 
-                # Check for suspicious objects
                 if label.lower() in SUSPICIOUS_OBJECT_KEYWORDS:
                     alerts.append({
                         'type': 'suspicious_object',
@@ -1106,7 +1072,6 @@ def process_frame():
                     })
                     alert_count += 1
 
-        # Face detection and matching (if query images provided)
         query_matches = []
         if query_images:
             query_signatures = _extract_query_signatures(query_images)
@@ -1125,13 +1090,11 @@ def process_frame():
                 matched = False
                 match_reason = None
                 
-                # Check object label overlap
                 label_overlap = set(signature['labels']).intersection(frame_labels)
                 if label_overlap:
                     matched = True
                     match_reason = f"Object match: {', '.join(sorted(label_overlap))}"
                 
-                # Check face matching: cosine similarity >= threshold means same person
                 if not matched:
                     for query_embedding in signature['face_embeddings']:
                         for frame_embedding in frame_face_embeddings:
@@ -1214,7 +1177,7 @@ def delete_visitor(visitor_id):
         if not deleted:
             return jsonify({'error': 'Visitor not found'}), 404
         conn.commit()
-        load_visitors_into_faiss()  # Sync FAISS after deletion
+        load_visitors_into_faiss()  
         return jsonify({'message': f'Visitor {visitor_id} deleted successfully'}), 200
     except Exception as e:
         logger.error(f"Delete visitor error: {e}")
@@ -1250,9 +1213,6 @@ def rename_visitor(visitor_id):
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Live Monitor Session Endpoints
-# ---------------------------------------------------------------------------
 
 @app.route('/live-monitor/start-session', methods=['POST', 'OPTIONS'])
 def live_monitor_start_session():
@@ -1294,7 +1254,6 @@ def live_monitor_start_session():
         for i, sig in enumerate(query_signatures):
             logger.info(f"  [{i}] {sig.get('filename')} -> Labels: {sig.get('labels')}, Faces: {len(sig.get('face_embeddings', []))}")
 
-        # Prepare a JSON-safe summary
         queries_summary = []
         for sig in query_signatures:
             queries_summary.append({
@@ -1339,7 +1298,6 @@ def live_monitor_process_frame():
     if not frame_file:
         return jsonify({'error': 'No frame provided'}), 400
 
-    # If no session_id, fall back to stateless frame processing
     session = None
     if session_id:
         with _session_lock:
@@ -1348,7 +1306,6 @@ def live_monitor_process_frame():
             return jsonify({'error': 'Invalid or expired session_id'}), 404
 
     try:
-        # Decode frame
         img_bytes = frame_file.read()
         nparr = np.frombuffer(img_bytes, np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -1357,7 +1314,6 @@ def live_monitor_process_frame():
 
         frame_h, frame_w = frame.shape[:2]
 
-        # --- YOLO detection ---
         results = model.predict(frame, conf=0.25, verbose=False)
         detections = []
         frame_alerts = []
@@ -1384,7 +1340,6 @@ def live_monitor_process_frame():
                     'is_query_match': False,
                 })
 
-                # Suspicious object alerts
                 if label.lower() in SUSPICIOUS_OBJECT_KEYWORDS:
                     frame_alerts.append({
                         'type': 'suspicious_object',
@@ -1393,11 +1348,9 @@ def live_monitor_process_frame():
                         'timestamp': _now_iso(),
                     })
 
-        # --- Face embeddings for this frame ---
         faces = _extract_faces_with_embeddings(frame)
         frame_face_embeddings = [f['embedding'] for f in faces if f['embedding'] is not None]
 
-        # --- Query presence tracking (session-based) ---
         query_presence = []
         session_alerts = []
 
@@ -1419,20 +1372,17 @@ def live_monitor_process_frame():
 
                 pstate = presence_map.get(idx, _init_presence_entry())
 
-                # --- Check if this query matches the current frame ---
+               
                 matched = False
                 match_reason = None
 
-                # Matching Logic:
-                # 1. If query has faces -> REQUIRE face match (strict).
-                # 2. If query has NO faces -> Allow object label match (e.g. for dogs, backpacks).
                 
                 has_query_face = len(signature.get('face_embeddings', [])) > 0
                 matched = False
                 match_reason = None
 
                 if has_query_face:
-                    # STRICT FACE MATCHING
+                   
                     if frame_face_embeddings:
                         best_sim = None
                         for q_emb in signature['face_embeddings']:
@@ -1444,16 +1394,14 @@ def live_monitor_process_frame():
                         if best_sim is not None and best_sim >= FACE_MATCH_THRESHOLD:
                             matched = True
                             match_reason = f"Face match (sim={best_sim:.3f})"
-                            # Highlight the person
+                           
                             for det in detections:
                                 if det['label'] == 'person':
                                     det['is_query_match'] = True
                 else:
-                    # OBJECT LABEL MATCHING (for non-face queries)
+                   
                     label_overlap = set(signature.get('labels', [])).intersection(frame_labels)
                     if label_overlap:
-                        # Still exclude lone 'person' if no face was found in query image 
-                        # to avoid matching every person when the query was intended to be a person
                         if label_overlap == {'person'}:
                              matched = False 
                         else:
@@ -1466,7 +1414,7 @@ def live_monitor_process_frame():
                 if matched:
                     logger.info(f"MATCH FOUND for session {session_id}, query {idx}: {match_reason}")
 
-                # --- Update presence state ---
+                
                 if matched:
                     pstate['miss_counter'] = 0
                     pstate['last_seen_at'] = now_str
@@ -1491,15 +1439,12 @@ def live_monitor_process_frame():
                         session_alerts.append(alert_msg)
                         frame_alerts.append(alert_msg)
                 else:
-                    # Not matched this frame
                     pstate['miss_counter'] = pstate.get('miss_counter', 0) + 1
 
                     if pstate['is_present'] and pstate['miss_counter'] >= PRESENCE_MISS_TOLERANCE:
-                        # LEFT
                         pstate['is_present'] = False
                         pstate['left_at'] = now_str
 
-                        # Calculate segment duration
                         seg_start = pstate.get('continuous_since', now_str)
                         try:
                             dt_start = datetime.datetime.fromisoformat(seg_start)
@@ -1516,7 +1461,6 @@ def live_monitor_process_frame():
                         })
                         pstate['continuous_since'] = None
 
-                        # Format duration
                         mins = int(seg_duration // 60)
                         secs = int(seg_duration % 60)
                         dur_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
@@ -1535,8 +1479,6 @@ def live_monitor_process_frame():
 
                 presence_map[idx] = pstate
 
-                # Build response entry
-                # Calculate current segment duration if still present
                 current_seg_duration = 0.0
                 if pstate['is_present'] and pstate.get('continuous_since'):
                     try:
@@ -1560,7 +1502,6 @@ def live_monitor_process_frame():
                     'match_reason': pstate.get('match_reason'),
                 })
 
-            # Persist alerts to session
             if session_alerts:
                 session['alerts'].extend(session_alerts)
 
@@ -1613,7 +1554,6 @@ def live_monitor_stop_session():
         for idx, signature in enumerate(session['query_signatures']):
             pstate = session['presence'].get(idx, {})
 
-            # If still present at stop time, close the segment
             if pstate.get('is_present') and pstate.get('continuous_since'):
                 try:
                     dt_start = datetime.datetime.fromisoformat(pstate['continuous_since'])
@@ -1679,11 +1619,11 @@ def internal_error(error):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
-    # Use environment variable for debug mode, default to False for production safety
+    
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     
-    # Configure timeouts and limits
+
     import socket
-    socket.setdefaulttimeout(600)  # 10 minute timeout for video processing
+    socket.setdefaulttimeout(600) 
     
     app.run(host='0.0.0.0', port=port, debug=debug_mode, threaded=True)
